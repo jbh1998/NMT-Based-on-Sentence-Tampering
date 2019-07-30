@@ -1,0 +1,88 @@
+一，代码组成：
+fairseq为机器翻译代码，是在facebook fairseq上修改并实验
+AutoPhrase-master只是一个翻译优化实现中，用来做短语划分需要用到的工具
+
+二，fairseq 机器翻译说明：
+(1) wmt14 en-de数据处理：
+$ cd examples/translation/
+$ bash prepare-wmt14en2de.sh
+$ cd ../..
+
+TEXT=examples/translation/wmt14_en_de
+python preprocess.py --source-lang en --target-lang de \
+  --trainpref $TEXT/train --validpref $TEXT/valid --testpref $TEXT/test \
+  --destdir data-bin/wmt14_en_de --thresholdtgt 0 --thresholdsrc 0  \
+  --joined-dictionary
+  
+(2)运行：
+
+python train.py data-bin/wmt14_en_de \
+  --arch transformer_wmt_en_de --share-all-embeddings \
+  --optimizer adam --adam-betas '(0.9, 0.98)' --clip-norm 0.0 \
+  --lr-scheduler inverse_sqrt --warmup-init-lr 1e-07 --warmup-updates  4000 \
+  --lr 0.0005 --min-lr 1e-09 \
+  --dropout 0.3 --weight-decay 0.0 --criterion label_smoothed_cross_entropy --label-smoothing 0.1 \
+  --max-tokens 6000 \
+  --save-dir checkpoints/transformer
+  
+(3)测试：
+python generate.py data-bin/wmt14_en_de \
+  --path checkpoints/transformer_stopwords/checkpoint_best.pt --beam 5 --remove-bpe
+
+三，实现的优化：
+包含输入篡改和输出篡改两方面，输入篡改对Encoder输入加噪音，输出篡改是对Decoder输出前缀叫噪音
+（1）输入篡改：
+1,train.py的train函数中，设if_input_modify = True开启输入篡改
+
+2,具体输入篡改的代码在 /fairseq/data/language_pair_dataset.py 中：
+在从数据集取出数据时（ __getitem__ ），判断是训练过程，对取出的源语言数据进行篡改：
+src_item = self.chg_item_new(src_item.tolist(),index)
+
+3,具体篡改方式见chg_item_new函数：
+先设置篡改比例（这里先增大后减小）
+根据篡改次数把句子分成等长区间，每个区间随机选个位置和方式进行篡改。
+篡改方式： 近义词替换 0.7 短语内或短语间对调 0.1 停用词添加 0.1 停用词删除 0.1
+近义词替换（包含遮掩）、停用词、短语划分相关函数实现见代码
+
+4,输入篡改所需数据：train.py的train函数中：
+task.dataset(args.train_subset).src_dict.read_near("data-bin/wmt14_en_de3/vector/train.en-de.en.near")
+task.dataset(args.train_subset).src_dict.read_stopwords("data-bin/wmt14_en_de3/dict.stopwords.en.txt")
+task.dataset(args.train_subset).read_phrase("data-bin/wmt14_en_de3/wmt14_phrase.en")
+第一个文件是每个单词最近且相似度大于阈值的至多三个近义词表，每行包含对应单词，及其至多三个近义词
+第二个文件是词典中的停用词表
+第三个文件是对所有源语言输入数据的短语粒度划分
+获取这三个文件的方式后面会细说
+
+（2）输出篡改：
+1,train.py的train函数中，设if_prev_out_modify = True开启输入篡改
+
+2,输出篡改位置在train.py的train函数中：
+samples = modifyPrevOut(samples,epoch_itr.epoch, task.dataset(args.train_subset))
+
+3,具体篡改函数：modifyPrevOut
+也是先判定篡改次数，再划分区间进行篡改
+这里为了保持前缀不变，只用近义词替换（包含遮掩）、对调两种方式
+注：前面实验时没来得及对目标语言进行短语粒度划分，所以短语粒度划分暂时注释掉（读文件、get phrase seg、use phrase seg to exchange），有了划分后即可去掉注释并使用。
+注：与输入篡改实现的位置不同，是因为输入篡改可变长，最好在构成tensor结构前篡改。而输出篡改是对decoder输出前缀，只有构成tensor后才出现。
+
+4,输入所需数据：
+task.dataset(args.train_subset).tgt_dict.read_near("data-bin/wmt14_en_de3/vector/train.en-de.de.near")
+#task.dataset(args.train_subset).read_phrase("data-bin/wmt14_en_de3/wmt14_phrase.de", False)    
+#如果有短语划分，可以用
+
+（3）停用词表、近义词表、短语划分的生成。
+1,停用词表是直接在网上寻找停用词表，再映射到词典中，getData.py里有相关代码
+
+2,近义词表是用fasttext训练词向量，再计算相似度得到。这里需安装gensim，用其中的FastText训练并计算近义词。
+具体代码也在getData.py中。
+
+3,短语粒度划分是用AutoPhrase-master中代码进行操作。
+先通过词典构建词到token_id的映射文件 AutoPhrase-master/data/EN/getMap.py，和训练数据一起作为输入
+具体过程见AutoPhrase-master/auto_phrase.sh
+最后AutoPhrase-master/tmp/tokenized_segmented_out.txt为所求划分
+注：训练目标语言的划分需要从wiki下对应语言的停用词、短语、高质量短语作为训练数据
+
+
+  
+  
+
